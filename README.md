@@ -11,4 +11,4 @@ It implements Tensor Autograd, matrix multiplication, and a PyTorch-like API (`n
 
 ## Installation
 
-pip install cllm
+pip install llmgrad
