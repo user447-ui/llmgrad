@@ -1,0 +1,16 @@
+# Colab system files
+.config/
+sample_data/
+.ipynb_checkpoints/
+
+# Python build artifacts
+__pycache__/
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+
+# Model weights
+*.safetensors
+*.pkl
