@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 import os
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 here = os.path.abspath(os.path.dirname(__file__))
 with open(os.path.join(here, "README.md"), encoding="utf-8") as f:
     long_description = f.read()
