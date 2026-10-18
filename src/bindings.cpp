@@ -1,49 +1,71 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <stdexcept>
 #include "tensor.hpp"
 
 namespace py = pybind11;
 
 TensorPtr embedding_forward(TensorPtr w, const std::vector<int>& idx) {
-    int rows = idx.size(), cols = w->shape[1];
+    if (!w || w->shape.size() != 2) {
+        throw std::invalid_argument("Embedding: weight must be a 2D tensor");
+    }
+    if (idx.empty()) throw std::invalid_argument("Embedding: indices must not be empty");
+    const int rows = static_cast<int>(idx.size());
+    const int cols = w->shape[1];
+    for (int index : idx) {
+        if (index < 0 || index >= w->shape[0]) {
+            throw std::out_of_range("Embedding: index is out of range");
+        }
+    }
     auto out = Tensor::zeros(rows, cols);
-    for(int i=0; i<rows; ++i) 
-        for(int j=0; j<cols; ++j) 
-            out->data[i*cols+j] = w->data[idx[i]*cols+j];
-    
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < cols; ++j)
+            out->data[i * cols + j] = w->data[idx[i] * cols + j];
+
     out->_prev = {w};
     out->_backward = [out, w, idx, cols]() {
-        for(int i=0; i<(int)idx.size(); ++i)
-            for(int j=0; j<cols; ++j)
-                w->grad[idx[i]*cols+j] += out->grad[i*cols+j];
+        for (int i = 0; i < static_cast<int>(idx.size()); ++i)
+            for (int j = 0; j < cols; ++j)
+                w->grad[idx[i] * cols + j] += out->grad[i * cols + j];
     };
     return out;
 }
 
 TensorPtr embedding_concat(TensorPtr w, const std::vector<int>& flat_indices, int block_size) {
-    int total_indices = flat_indices.size();
-    if (total_indices % block_size != 0) throw std::runtime_error("Indices error: total size not divisible by block_size");
-    int batch_size = total_indices / block_size;
-    int emb_dim = w->shape[1];
-    int out_cols = emb_dim * block_size;
-    
+    if (!w || w->shape.size() != 2) {
+        throw std::invalid_argument("Embedding: weight must be a 2D tensor");
+    }
+    if (block_size <= 0) throw std::invalid_argument("Embedding: block_size must be positive");
+    if (flat_indices.empty()) throw std::invalid_argument("Embedding: indices must not be empty");
+    const int total_indices = static_cast<int>(flat_indices.size());
+    if (total_indices % block_size != 0) {
+        throw std::invalid_argument("Embedding: index count must be divisible by block_size");
+    }
+    const int batch_size = total_indices / block_size;
+    const int emb_dim = w->shape[1];
+    for (int index : flat_indices) {
+        if (index < 0 || index >= w->shape[0]) {
+            throw std::out_of_range("Embedding: index is out of range");
+        }
+    }
+    const int out_cols = emb_dim * block_size;
     auto out = std::make_shared<Tensor>(std::vector<int>{batch_size, out_cols});
-    
-    for(int b=0; b<batch_size; ++b) {
-        for(int k=0; k<block_size; ++k) {
-            int token_idx = flat_indices[b * block_size + k];
-            for(int d=0; d<emb_dim; ++d) {
+
+    for (int b = 0; b < batch_size; ++b) {
+        for (int k = 0; k < block_size; ++k) {
+            const int token_idx = flat_indices[b * block_size + k];
+            for (int d = 0; d < emb_dim; ++d) {
                 out->data[b * out_cols + k * emb_dim + d] = w->data[token_idx * emb_dim + d];
             }
         }
     }
-    
+
     out->_prev = {w};
     out->_backward = [out, w, flat_indices, block_size, batch_size, emb_dim, out_cols]() {
-        for(int b=0; b<batch_size; ++b) {
-            for(int k=0; k<block_size; ++k) {
-                int token_idx = flat_indices[b * block_size + k];
-                for(int d=0; d<emb_dim; ++d) {
+        for (int b = 0; b < batch_size; ++b) {
+            for (int k = 0; k < block_size; ++k) {
+                const int token_idx = flat_indices[b * block_size + k];
+                for (int d = 0; d < emb_dim; ++d) {
                     w->grad[token_idx * emb_dim + d] += out->grad[b * out_cols + k * emb_dim + d];
                 }
             }
@@ -52,7 +74,6 @@ TensorPtr embedding_concat(TensorPtr w, const std::vector<int>& flat_indices, in
     return out;
 }
 
-// --- MODULE REGISTRATION ---
 PYBIND11_MODULE(ctensor, m) {
     py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
         .def_static("zeros", &Tensor::zeros)
@@ -63,17 +84,25 @@ PYBIND11_MODULE(ctensor, m) {
         .def_readwrite("shape", &Tensor::shape)
         .def("matmul", &Tensor::matmul)
         .def("add", &Tensor::add)
+        .def("mul", &Tensor::mul)
         .def("tanh", &Tensor::tanh)
+        .def("relu", &Tensor::relu)
+        .def("exp", &Tensor::exp)
+        .def("log", &Tensor::log)
+        .def("sum", &Tensor::sum)
+        .def("max", &Tensor::max)
         .def("reshape", &Tensor::reshape)
-        .def("layernorm", &Tensor::layernorm)
+        .def("layernorm", &Tensor::layernorm, py::arg("gamma"), py::arg("beta"), py::arg("eps") = 1e-5)
         .def("backward", &Tensor::backward)
         .def("cross_entropy", &Tensor::cross_entropy_loss)
         .def("__add__", &Tensor::add)
+        .def("__mul__", &Tensor::mul)
         .def("__matmul__", &Tensor::matmul)
         .def("__repr__", &Tensor::to_string)
         .def("zero_grad", [](TensorPtr t) { std::fill(t->grad.begin(), t->grad.end(), 0.0); })
         .def("sgd_step", [](TensorPtr t, double lr) {
-             for(size_t i=0; i<t->data.size(); ++i) t->data[i] -= lr * t->grad[i];
+            if (t->grad.size() != t->data.size()) throw std::runtime_error("Gradient/data size mismatch");
+            for (size_t i = 0; i < t->data.size(); ++i) t->data[i] -= lr * t->grad[i];
         });
 
     m.def("embedding_forward", &embedding_forward);

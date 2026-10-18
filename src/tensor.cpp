@@ -1,192 +1,241 @@
 #include "tensor.hpp"
-#include <cmath>
-#include <random>
+
 #include <algorithm>
+#include <cmath>
+#include <limits>
+#include <numeric>
+#include <random>
 #include <set>
 #include <stdexcept>
-#include <iostream>
-#include <numeric>
 
-// --- Utils ---
-int Tensor::size() const {
-    int s = 1;
-    for(int d : shape) s *= d;
-    return s;
-}
-
-// --- Constructor ---
-Tensor::Tensor(std::vector<int> s, std::vector<double> d) : shape(s) {
-    if (d.empty()) data.resize(size(), 0.0);
-    else {
-        if (d.size() != size()) throw std::runtime_error("Data size mismatch in constructor");
-        data = d;
+namespace {
+int checked_size(const std::vector<int>& shape) {
+    if (shape.empty()) {
+        throw std::invalid_argument("Tensor shape must not be empty");
     }
-    grad.resize(size(), 0.0);
-    _backward = [](){};
+    long long total = 1;
+    for (int dim : shape) {
+        if (dim <= 0) {
+            throw std::invalid_argument("Tensor dimensions must be positive");
+        }
+        total *= dim;
+        if (total > std::numeric_limits<int>::max()) {
+            throw std::invalid_argument("Tensor is too large");
+        }
+    }
+    return static_cast<int>(total);
 }
 
-// --- Factories ---
+bool same_shape(const std::vector<int>& a, const std::vector<int>& b) {
+    return a == b;
+}
+
+bool row_broadcast(const Tensor& lhs, const Tensor& rhs) {
+    return lhs.shape.size() == 2 && rhs.shape.size() == 2 &&
+           rhs.shape[0] == 1 && rhs.shape[1] == lhs.shape[1];
+}
+
+void validate_binary_shapes(const Tensor& lhs, const Tensor& rhs,
+                            const char* operation) {
+    if (!same_shape(lhs.shape, rhs.shape) && !row_broadcast(lhs, rhs)) {
+        throw std::invalid_argument(std::string(operation) +
+            ": shapes must match or the right operand must have shape [1, columns]");
+    }
+}
+}  // namespace
+
+int Tensor::size() const {
+    return checked_size(shape);
+}
+
+Tensor::Tensor(std::vector<int> s, std::vector<double> d) : shape(std::move(s)) {
+    const int n = checked_size(shape);
+    if (d.empty()) {
+        data.resize(static_cast<size_t>(n), 0.0);
+    } else {
+        if (static_cast<int>(d.size()) != n) {
+            throw std::invalid_argument("Data size mismatch in constructor");
+        }
+        data = std::move(d);
+    }
+    grad.resize(static_cast<size_t>(n), 0.0);
+    _backward = [] {};
+}
+
 TensorPtr Tensor::zeros(int rows, int cols) {
     return std::make_shared<Tensor>(std::vector<int>{rows, cols});
 }
 
 TensorPtr Tensor::randn(int rows, int cols) {
     auto t = zeros(rows, cols);
-    std::default_random_engine gen;
-    std::normal_distribution<double> dist(0.0, 1.0/std::sqrt(cols)); 
-    for(auto& v : t->data) v = dist(gen);
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::normal_distribution<double> dist(0.0, 1.0 / std::sqrt(static_cast<double>(cols)));
+    for (auto& v : t->data) v = dist(gen);
     return t;
 }
 
 TensorPtr Tensor::from_list(std::vector<int> shape, const std::vector<double>& list) {
-    return std::make_shared<Tensor>(shape, list);
+    return std::make_shared<Tensor>(std::move(shape), list);
 }
 
-// --- Core Ops ---
-
 TensorPtr Tensor::reshape(const std::vector<int>& new_shape) {
-    int new_size = 1;
-    for(int s : new_shape) new_size *= s;
-    if (new_size != size()) throw std::runtime_error("Reshape: total elements mismatch");
-
+    if (checked_size(new_shape) != size()) {
+        throw std::invalid_argument("Reshape: total elements mismatch");
+    }
     auto out = std::make_shared<Tensor>(new_shape, data);
-    
-    out->_prev = {shared_from_this()};
-    out->_backward = [out, this_ptr=shared_from_this()]() {
-        for(int i=0; i<out->size(); ++i) {
-            this_ptr->grad[i] += out->grad[i];
-        }
+    auto self = shared_from_this();
+    out->_prev = {self};
+    out->_backward = [out, self]() {
+        for (int i = 0; i < out->size(); ++i) self->grad[i] += out->grad[i];
     };
     return out;
 }
 
 TensorPtr Tensor::add(TensorPtr other) {
+    if (!other) throw std::invalid_argument("Add: other tensor must not be null");
+    validate_binary_shapes(*this, *other, "Add");
+    const bool broadcast = !same_shape(shape, other->shape);
+    const int cols = shape.back();
     auto out = std::make_shared<Tensor>(shape);
-    bool broadcast = (other->size() < size());
-    
-    int cols = shape.back();
-    
     for (int i = 0; i < size(); ++i) {
-        double b_val = broadcast ? other->data[i % cols] : other->data[i];
-        out->data[i] = data[i] + b_val;
+        const int j = broadcast ? i % cols : i;
+        out->data[i] = data[i] + other->data[j];
     }
-    
-    out->_prev = {shared_from_this(), other};
-    out->_backward = [out, this_ptr=shared_from_this(), other, broadcast, cols]() {
+
+    auto self = shared_from_this();
+    out->_prev = {self, other};
+    out->_backward = [out, self, other, broadcast, cols]() {
         for (int i = 0; i < out->size(); ++i) {
-            this_ptr->grad[i] += out->grad[i];
-            if(broadcast) other->grad[i % cols] += out->grad[i];
-            else other->grad[i] += out->grad[i];
+            self->grad[i] += out->grad[i];
+            other->grad[broadcast ? i % cols : i] += out->grad[i];
+        }
+    };
+    return out;
+}
+
+TensorPtr Tensor::mul(TensorPtr other) {
+    if (!other) throw std::invalid_argument("Mul: other tensor must not be null");
+    validate_binary_shapes(*this, *other, "Mul");
+    const bool broadcast = !same_shape(shape, other->shape);
+    const int cols = shape.back();
+    auto out = std::make_shared<Tensor>(shape);
+    for (int i = 0; i < size(); ++i) {
+        const int j = broadcast ? i % cols : i;
+        out->data[i] = data[i] * other->data[j];
+    }
+
+    auto self = shared_from_this();
+    out->_prev = {self, other};
+    out->_backward = [out, self, other, broadcast, cols]() {
+        for (int i = 0; i < out->size(); ++i) {
+            const int j = broadcast ? i % cols : i;
+            self->grad[i] += other->data[j] * out->grad[i];
+            other->grad[j] += self->data[i] * out->grad[i];
         }
     };
     return out;
 }
 
 TensorPtr Tensor::matmul(TensorPtr other) {
-    if(shape.size() != 2 || other->shape.size() != 2) 
-        throw std::runtime_error("Matmul currently supports only 2D tensors. Use reshape.");
+    if (!other) throw std::invalid_argument("Matmul: other tensor must not be null");
+    if (shape.size() != 2 || other->shape.size() != 2) {
+        throw std::invalid_argument("Matmul currently supports only 2D tensors");
+    }
+    const int m = shape[0], k = shape[1], n = other->shape[1];
+    if (k != other->shape[0]) {
+        throw std::invalid_argument("Matmul: inner dimensions must match");
+    }
 
-    int M = shape[0], K = shape[1], N = other->shape[1];
-    auto out = zeros(M, N);
-    
+    auto out = zeros(m, n);
     #pragma omp parallel for collapse(2)
-    for (int m = 0; m < M; ++m) 
-        for (int n = 0; n < N; ++n) {
-            double sum = 0;
-            for (int k = 0; k < K; ++k) sum += data[m*K+k] * other->data[k*N+n];
-            out->data[m*N+n] = sum;
+    for (int i = 0; i < m; ++i) {
+        for (int j = 0; j < n; ++j) {
+            double sum = 0.0;
+            for (int p = 0; p < k; ++p) sum += data[i * k + p] * other->data[p * n + j];
+            out->data[i * n + j] = sum;
         }
-    
-    out->_prev = {shared_from_this(), other};
-    out->_backward = [out, this_ptr=shared_from_this(), other, M, K, N]() {
-        for (int m=0; m<M; ++m)
-            for (int n=0; n<N; ++n) {
-                 double g = out->grad[m*N+n];
-                 for (int k=0; k<K; ++k) {
-                     this_ptr->grad[m*K+k] += g * other->data[k*N+n];
-                     other->grad[k*N+n] += this_ptr->data[m*K+k] * g;
-                 }
+    }
+
+    auto self = shared_from_this();
+    out->_prev = {self, other};
+    out->_backward = [out, self, other, m, k, n]() {
+        for (int i = 0; i < m; ++i) {
+            for (int j = 0; j < n; ++j) {
+                const double g = out->grad[i * n + j];
+                for (int p = 0; p < k; ++p) {
+                    self->grad[i * k + p] += g * other->data[p * n + j];
+                    other->grad[p * n + j] += self->data[i * k + p] * g;
+                }
             }
+        }
     };
     return out;
 }
 
-// Fused LayerNorm: (x - mean) / sqrt(var + eps) * gamma + beta
 TensorPtr Tensor::layernorm(TensorPtr gamma, TensorPtr beta, double eps) {
-    int batch = shape[0];
-    int emb = shape[1];
-    
+    if (!gamma || !beta) throw std::invalid_argument("LayerNorm: gamma and beta must not be null");
+    if (shape.size() != 2) throw std::invalid_argument("LayerNorm expects a 2D [batch, features] tensor");
+    const int batch = shape[0], features = shape[1];
+    if (gamma->size() != features || beta->size() != features) {
+        throw std::invalid_argument("LayerNorm: gamma and beta must contain one value per feature");
+    }
+    if (eps <= 0.0 || !std::isfinite(eps)) {
+        throw std::invalid_argument("LayerNorm: eps must be finite and positive");
+    }
+
     auto out = std::make_shared<Tensor>(shape);
-    
-    auto cache_mean = std::make_shared<std::vector<double>>(batch);
-    auto cache_rstd = std::make_shared<std::vector<double>>(batch);
-    
-    for(int b=0; b<batch; ++b) {
-        // 1. Mean
-        double sum = 0;
-        for(int i=0; i<emb; ++i) sum += data[b*emb+i];
-        double mean = sum / emb;
-        (*cache_mean)[b] = mean;
-        
-        // 2. Variance
-        double sum_sq = 0;
-        for(int i=0; i<emb; ++i) {
-            double d = data[b*emb+i] - mean;
-            sum_sq += d*d;
+    auto mean_cache = std::make_shared<std::vector<double>>(batch, 0.0);
+    auto rstd_cache = std::make_shared<std::vector<double>>(batch, 0.0);
+
+    for (int b = 0; b < batch; ++b) {
+        double mean = 0.0;
+        for (int j = 0; j < features; ++j) mean += data[b * features + j];
+        mean /= features;
+
+        double variance = 0.0;
+        for (int j = 0; j < features; ++j) {
+            const double centered = data[b * features + j] - mean;
+            variance += centered * centered;
         }
-        double var = sum_sq / emb;
-        double rstd = 1.0 / std::sqrt(var + eps);
-        (*cache_rstd)[b] = rstd;
-        
-        // 3. Normalize & Scale
-        for(int i=0; i<emb; ++i) {
-            double n = (data[b*emb+i] - mean) * rstd;
-            double g = gamma->data[i];
-            double bt = beta->data[i];
-            out->data[b*emb+i] = n * g + bt;
+        variance /= features;
+        const double rstd = 1.0 / std::sqrt(variance + eps);
+        (*mean_cache)[b] = mean;
+        (*rstd_cache)[b] = rstd;
+
+        for (int j = 0; j < features; ++j) {
+            const double xhat = (data[b * features + j] - mean) * rstd;
+            out->data[b * features + j] = xhat * gamma->data[j] + beta->data[j];
         }
     }
-    
-    out->_prev = {shared_from_this(), gamma, beta};
-    out->_backward = [out, this_ptr=shared_from_this(), gamma, beta, cache_mean, cache_rstd, batch, emb]() {
-        for(int b=0; b<batch; ++b) {
-            double mean = (*cache_mean)[b];
-            double rstd = (*cache_rstd)[b];
-            
-            double d_sigma = 0;
-            double d_mean = 0;
-            
-            for(int i=0; i<emb; ++i) {
-                double g = gamma->data[i];
-                double dy = out->grad[b*emb+i];
-                double x_hat = (this_ptr->data[b*emb+i] - mean) * rstd;
-                
-                // dL/dGamma
-                gamma->grad[i] += dy * x_hat;
-                // dL/dBeta
-                beta->grad[i] += dy;
-                
-                // Backprop through scaling
-                double dx_hat = dy * g;
-                
-                // Accumulate for mean/std
-                d_sigma += dx_hat * (this_ptr->data[b*emb+i] - mean);
-                d_mean -= dx_hat;
+
+    auto self = shared_from_this();
+    out->_prev = {self, gamma, beta};
+    out->_backward = [out, self, gamma, beta, mean_cache, rstd_cache, batch, features]() {
+        for (int b = 0; b < batch; ++b) {
+            const double mean = (*mean_cache)[b];
+            const double rstd = (*rstd_cache)[b];
+            double sum_dxhat = 0.0;
+            double sum_dxhat_xhat = 0.0;
+
+            for (int j = 0; j < features; ++j) {
+                const int idx = b * features + j;
+                const double xhat = (self->data[idx] - mean) * rstd;
+                const double dy = out->grad[idx];
+                const double dxhat = dy * gamma->data[j];
+                gamma->grad[j] += dy * xhat;
+                beta->grad[j] += dy;
+                sum_dxhat += dxhat;
+                sum_dxhat_xhat += dxhat * xhat;
             }
-            
-            d_sigma *= -0.5 * rstd * rstd * rstd;
-            
-            // Final gradients w.r.t input
-            for(int i=0; i<emb; ++i) {
-                double dy = out->grad[b*emb+i];
-                double g = gamma->data[i];
-                double dx_hat = dy * g;
-                
-                double term1 = dx_hat * rstd;
-                double term2 = d_sigma * 2 * (this_ptr->data[b*emb+i] - mean) / emb;
-                double term3 = d_mean * rstd / emb;
-                
-                this_ptr->grad[b*emb+i] += term1 + term2 + (d_mean + d_sigma * 0) / emb; 
+
+            // dx = rstd / N * (N*dxhat - sum(dxhat) - xhat*sum(dxhat*xhat))
+            for (int j = 0; j < features; ++j) {
+                const int idx = b * features + j;
+                const double xhat = (self->data[idx] - mean) * rstd;
+                const double dxhat = out->grad[idx] * gamma->data[j];
+                self->grad[idx] += (rstd / features) *
+                    (features * dxhat - sum_dxhat - xhat * sum_dxhat_xhat);
             }
         }
     };
@@ -195,92 +244,13 @@ TensorPtr Tensor::layernorm(TensorPtr gamma, TensorPtr beta, double eps) {
 
 TensorPtr Tensor::tanh() {
     auto out = std::make_shared<Tensor>(shape);
-    for(int i=0; i<size(); ++i) out->data[i] = std::tanh(data[i]);
-    out->_prev = {shared_from_this()};
-    out->_backward = [out, this_ptr=shared_from_this()]() {
-        for(int i=0; i<out->size(); ++i) {
-            double t = out->data[i];
-            this_ptr->grad[i] += (1.0 - t * t) * out->grad[i];
-        }
-    };
-    return out;
-}
-
-TensorPtr Tensor::cross_entropy_loss(const std::vector<int>& targets) {
-    int batch = shape[0], classes = shape[1];
-    auto out = std::make_shared<Tensor>(std::vector<int>{1,1});
-    auto probs = std::make_shared<std::vector<double>>(data.size());
-    double total_loss = 0;
-    
-    for(int b=0; b<batch; ++b) {
-        double mx = -1e9;
-        for(int c=0; c<classes; ++c) if(data[b*classes+c] > mx) mx = data[b*classes+c];
-        double sum = 0;
-        for(int c=0; c<classes; ++c) {
-            double e = std::exp(data[b*classes+c] - mx);
-            (*probs)[b*classes+c] = e;
-            sum += e;
-        }
-        for(int c=0; c<classes; ++c) (*probs)[b*classes+c] /= sum;
-        total_loss -= std::log((*probs)[b*classes + targets[b]] + 1e-7);
-    }
-    out->data[0] = total_loss / batch;
-    out->_prev = {shared_from_this()};
-    out->_backward = [out, this_ptr=shared_from_this(), targets, probs, batch, classes]() {
-        double g = out->grad[0] / batch;
-        for(int b=0; b<batch; ++b) {
-            int t = targets[b];
-            for(int c=0; c<classes; ++c) {
-                this_ptr->grad[b*classes+c] += ((*probs)[b*classes+c] - (c==t?1.0:0.0)) * g;
-            }
-        }
-    };
-    return out;
-}
-
-TensorPtr Tensor::mul(TensorPtr other) {
-    auto out = std::make_shared<Tensor>(shape);
-    bool broadcast = (other->size() < size());
-    int mod = other->size();
-
-    #pragma omp parallel for
-    for (int i = 0; i < size(); ++i) {
-        double b_val = broadcast ? other->data[i % mod] : other->data[i];
-        out->data[i] = data[i] * b_val;
-    }
-
-    out->_prev = {shared_from_this(), other};
-    out->_backward = [out, this_ptr=shared_from_this(), other, broadcast, mod]() {
+    for (int i = 0; i < size(); ++i) out->data[i] = std::tanh(data[i]);
+    auto self = shared_from_this();
+    out->_prev = {self};
+    out->_backward = [out, self]() {
         for (int i = 0; i < out->size(); ++i) {
-            double g = out->grad[i];
-            double b_val = broadcast ? other->data[i % mod] : other->data[i];
-            
-            this_ptr->grad[i] += b_val * g; // dL/da = b * g
-            
-            if (broadcast) {
-                other->grad[i % mod] += this_ptr->data[i] * g; // dL/db = a * g
-            } else {
-                other->grad[i] += this_ptr->data[i] * g;
-            }
-        }
-    };
-    return out;
-}
-
-TensorPtr Tensor::relu() {
-    auto out = std::make_shared<Tensor>(shape);
-    
-    #pragma omp parallel for
-    for(int i=0; i<size(); ++i) {
-        out->data[i] = (data[i] > 0) ? data[i] : 0.0;
-    }
-    
-    out->_prev = {shared_from_this()};
-    out->_backward = [out, this_ptr=shared_from_this()]() {
-        for(int i=0; i<out->size(); ++i) {
-            if (out->data[i] > 0) {
-                this_ptr->grad[i] += out->grad[i];
-            }
+            const double t = out->data[i];
+            self->grad[i] += (1.0 - t * t) * out->grad[i];
         }
     };
     return out;
@@ -289,26 +259,38 @@ TensorPtr Tensor::relu() {
 TensorPtr Tensor::exp() {
     auto out = std::make_shared<Tensor>(shape);
     #pragma omp parallel for
-    for(int i=0; i<size(); ++i) out->data[i] = std::exp(data[i]);
-    
-    out->_prev = {shared_from_this()};
-    out->_backward = [out, this_ptr=shared_from_this()]() {
-        for(int i=0; i<out->size(); ++i) {
-            this_ptr->grad[i] += out->data[i] * out->grad[i];
-        }
+    for (int i = 0; i < size(); ++i) out->data[i] = std::exp(data[i]);
+    auto self = shared_from_this();
+    out->_prev = {self};
+    out->_backward = [out, self]() {
+        for (int i = 0; i < out->size(); ++i) self->grad[i] += out->data[i] * out->grad[i];
     };
     return out;
 }
 
 TensorPtr Tensor::log() {
     auto out = std::make_shared<Tensor>(shape);
+    for (int i = 0; i < size(); ++i) {
+        if (data[i] <= 0.0) throw std::domain_error("Log requires strictly positive inputs");
+        out->data[i] = std::log(data[i]);
+    }
+    auto self = shared_from_this();
+    out->_prev = {self};
+    out->_backward = [out, self]() {
+        for (int i = 0; i < out->size(); ++i) self->grad[i] += out->grad[i] / self->data[i];
+    };
+    return out;
+}
+
+TensorPtr Tensor::relu() {
+    auto out = std::make_shared<Tensor>(shape);
     #pragma omp parallel for
-    for(int i=0; i<size(); ++i) out->data[i] = std::log(data[i]);
-    
-    out->_prev = {shared_from_this()};
-    out->_backward = [out, this_ptr=shared_from_this()]() {
-        for(int i=0; i<out->size(); ++i) {
-            this_ptr->grad[i] += (1.0 / this_ptr->data[i]) * out->grad[i];
+    for (int i = 0; i < size(); ++i) out->data[i] = data[i] > 0.0 ? data[i] : 0.0;
+    auto self = shared_from_this();
+    out->_prev = {self};
+    out->_backward = [out, self]() {
+        for (int i = 0; i < out->size(); ++i) {
+            if (self->data[i] > 0.0) self->grad[i] += out->grad[i];
         }
     };
     return out;
@@ -316,54 +298,99 @@ TensorPtr Tensor::log() {
 
 TensorPtr Tensor::sum() {
     auto out = std::make_shared<Tensor>(std::vector<int>{1, 1});
-    double total = 0;
-    
-    for(double v : data) total += v;
-    out->data[0] = total;
-    
-    out->_prev = {shared_from_this()};
-    out->_backward = [out, this_ptr=shared_from_this()]() {
-        double g = out->grad[0];
-        for(int i=0; i<this_ptr->size(); ++i) {
-            this_ptr->grad[i] += g;
-        }
+    out->data[0] = std::accumulate(data.begin(), data.end(), 0.0);
+    auto self = shared_from_this();
+    out->_prev = {self};
+    out->_backward = [out, self]() {
+        for (int i = 0; i < self->size(); ++i) self->grad[i] += out->grad[0];
     };
     return out;
 }
 
 TensorPtr Tensor::max() {
+    if (data.empty()) throw std::invalid_argument("Max requires a non-empty tensor");
+    const auto it = std::max_element(data.begin(), data.end());
+    const int index = static_cast<int>(std::distance(data.begin(), it));
     auto out = std::make_shared<Tensor>(std::vector<int>{1, 1});
-    double max_val = -1e18;
-    int idx = 0;
-    
-    for(int i=0; i<size(); ++i) {
-        if(data[i] > max_val) {
-            max_val = data[i];
-            idx = i;
+    out->data[0] = *it;
+    auto self = shared_from_this();
+    out->_prev = {self};
+    out->_backward = [out, self, index]() { self->grad[index] += out->grad[0]; };
+    return out;
+}
+
+TensorPtr Tensor::cross_entropy_loss(const std::vector<int>& targets) {
+    if (shape.size() != 2) throw std::invalid_argument("CrossEntropy expects [batch, classes] logits");
+    const int batch = shape[0], classes = shape[1];
+    if (static_cast<int>(targets.size()) != batch) {
+        throw std::invalid_argument("CrossEntropy: target count must equal batch size");
+    }
+    for (int target : targets) {
+        if (target < 0 || target >= classes) {
+            throw std::out_of_range("CrossEntropy: target index is out of range");
         }
     }
-    out->data[0] = max_val;
-    
-    out->_prev = {shared_from_this()};
-    out->_backward = [out, this_ptr=shared_from_this(), idx]() {
-        this_ptr->grad[idx] += out->grad[0];
+
+    auto out = std::make_shared<Tensor>(std::vector<int>{1, 1});
+    auto probs = std::make_shared<std::vector<double>>(data.size(), 0.0);
+    double total_loss = 0.0;
+    for (int b = 0; b < batch; ++b) {
+        const auto begin = data.begin() + b * classes;
+        const double max_logit = *std::max_element(begin, begin + classes);
+        double exp_sum = 0.0;
+        for (int c = 0; c < classes; ++c) {
+            const double e = std::exp(data[b * classes + c] - max_logit);
+            (*probs)[b * classes + c] = e;
+            exp_sum += e;
+        }
+        for (int c = 0; c < classes; ++c) (*probs)[b * classes + c] /= exp_sum;
+        total_loss += std::log(exp_sum) + max_logit - data[b * classes + targets[b]];
+    }
+    out->data[0] = total_loss / batch;
+    auto self = shared_from_this();
+    out->_prev = {self};
+    out->_backward = [out, self, targets, probs, batch, classes]() {
+        const double scale = out->grad[0] / batch;
+        for (int b = 0; b < batch; ++b) {
+            for (int c = 0; c < classes; ++c) {
+                self->grad[b * classes + c] +=
+                    ((*probs)[b * classes + c] - (c == targets[b] ? 1.0 : 0.0)) * scale;
+            }
+        }
     };
     return out;
 }
 
 void Tensor::backward() {
+    if (size() != 1) {
+        throw std::invalid_argument("Backward requires a scalar tensor; reduce the output first");
+    }
+
     std::vector<TensorPtr> topo;
     std::set<TensorPtr> visited;
-    std::function<void(TensorPtr)> build = [&](TensorPtr v) {
-        if(!visited.count(v)) { visited.insert(v); for(auto p : v->_prev) build(p); topo.push_back(v); }
+    std::function<void(TensorPtr)> build = [&](TensorPtr node) {
+        if (visited.insert(node).second) {
+            for (const auto& parent : node->_prev) build(parent);
+            topo.push_back(node);
+        }
     };
     build(shared_from_this());
-    std::fill(grad.begin(), grad.end(), 1.0);
+
+    // Intermediate gradients belong to this traversal; leaf gradients accumulate
+    // across calls, as expected by gradient-accumulation training loops.
+    for (const auto& node : topo) {
+        if (!node->_prev.empty()) std::fill(node->grad.begin(), node->grad.end(), 0.0);
+    }
+    grad[0] = 1.0;
     std::reverse(topo.begin(), topo.end());
-    for(auto v : topo) v->_backward();
+    for (const auto& node : topo) node->_backward();
 }
-std::string Tensor::to_string() { 
-    std::string s = "Tensor(";
-    for(int i=0; i<shape.size(); ++i) s += (i>0?"x":"") + std::to_string(shape[i]);
-    return s + ")"; 
+
+std::string Tensor::to_string() {
+    std::string result = "Tensor(";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i) result += "x";
+        result += std::to_string(shape[i]);
+    }
+    return result + ")";
 }
