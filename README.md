@@ -1,87 +1,81 @@
 # 🔥 llmgrad
 
-![Build Status](https://img.shields.io/github/actions/workflow/status/user447-ui/llmgrad/build_wheels.yml?label=build)
+![Build Status](https://img.shields.io/github/actions/workflow/status/user447-ui/llmgrad/tests.yml?label=tests)
 ![PyPI](https://img.shields.io/pypi/v/llmgrad)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 **llmgrad** is a lightweight Deep Learning framework written in **C++** with **Python bindings**.
-It implements a dynamic computation graph (Reverse-Mode Autodiff) similar to PyTorch, but runs on a highly optimized C++ backend using OpenMP for parallelization.
+It implements a dynamic computation graph (Reverse-Mode Autodiff) with a C++ backend and OpenMP parallelization.
 
-The goal of this project is to demystify how modern DL frameworks work under the hood by building one from scratch, bridging low-level memory management with high-level Python APIs.
+The goal of this project is to make modern deep-learning framework internals approachable by building the tensor and autograd core from scratch.
 
 ---
 
 ## 🚀 Key Features
 
-*   **⚡ High Performance Core:** Tensor operations (`matmul`, `add`, `tanh`, etc.) are implemented in C++ and accelerated using **OpenMP** (multi-threading).
-*   **🧠 Autograd Engine:** Automatic differentiation with support for dynamic graphs.
-*   **🛠 PyTorch-like API:** Familiar interface with `nn.Module`, `nn.Linear`, `optim.SGD`, and `Sequential` containers.
-*   **📚 NLP Optimized:** Specialized C++ kernels for efficient Embedding concatenation (`embedding_concat`) used in Context Windows.
-*   **🔧 Modern Architecture:**
-    *   **LayerNorm** implementation in C++.
-    *   **Safetensors** support for saving/loading weights.
-    *   **Fused CrossEntropyLoss** for numerical stability.
-*   **📦 Zero-Dependency Install:** Distributed as binary wheels for Linux, Windows, and macOS.
-
----
+* **C++ tensor core:** matrix multiplication, elementwise operations, activations and reductions.
+* **Reverse-mode autograd:** dynamic computation graphs and gradient accumulation on leaf tensors.
+* **Neural-network API:** `nn.Module`, `nn.Linear`, `nn.Embedding`, `nn.LayerNorm`, `nn.Sequential`.
+* **NLP primitives:** embedding lookup and context-window embedding concatenation.
+* **Serialization:** Safetensors support for model parameters.
+* **Cross-entropy:** numerically stable logits-based cross-entropy loss.
 
 ## 📥 Installation
 
-You can install the latest release directly from PyPI:
+Install from PyPI:
 
+```bash
+python -m pip install llmgrad
 ```
-pip install llmgrad
 
-Or build from source (requires a C++ compiler):
+Build from source:
+
+```bash
 git clone https://github.com/user447-ui/llmgrad.git
 cd llmgrad
-pip install .
+python -m pip install .
 ```
 
----
+## 🧪 Tests
+
+The test suite checks numerical gradients against finite differences, shape and target validation, repeated backward calls, and Python module/optimizer integration.
+
+```bash
+python -m pip install -e . pytest numpy
+python -m pytest -q
+```
+
+The CI workflow runs this suite on pushes to `main` and release branches, and on pull requests.
 
 ## 💻 Usage Example
-The API is designed to be nearly identical to PyTorch.
 
-1. Training a Model
-```
-import llmgrad
+```python
+import ctensor
 import llmgrad.nn as nn
 import llmgrad.optim as optim
 
-# 1. Define the Model
 model = nn.Sequential([
-    nn.Embedding(vocab_size=27, embedding_dim=10),
-    nn.Linear(in_features=10*3, out_features=64), # Context window = 3
-    nn.LayerNorm(64),
+    nn.Linear(4, 16),
     nn.Tanh(),
-    nn.Linear(64, 27)
+    nn.LayerNorm(16),
+    nn.Linear(16, 3),
 ])
 
-# 2. Setup Optimizer
-optimizer = optim.SGD(model.parameters(), lr=0.1)
+x = ctensor.Tensor.from_list([2, 4], [0.1, 0.2, 0.3, 0.4,
+                                      -0.1, 0.5, 0.2, 0.7])
+targets = [0, 2]
+optimizer = optim.SGD(model.parameters(), lr=0.05)
 
-# 3. Training Loop
-# x_batch: list of integers (indices)
-# y_batch: list of integers (targets)
-logits = model(x_batch)
-
-loss = logits.cross_entropy(y_batch)
-
+logits = model(x)
+loss = logits.cross_entropy(targets)
 optimizer.zero_grad()
 loss.backward()
 optimizer.step()
-
-print(f"Loss: {loss.data[0]}")
+print("loss:", loss.data[0])
 ```
 
-2. Saving & Loading
-We use the generic .safetensors format for weight serialization.
+## Notes
 
-```
-# Save weights
-model.save_pretrained("model.safetensors")
-
-# Load weights
-model.load_pretrained("model.safetensors")
-```
+* `backward()` is defined for scalar outputs. Call a reduction such as `sum()` or use a scalar loss before calling it.
+* Elementwise `add` and `mul` support equal shapes or row-broadcasting of a right-hand operand shaped `[1, columns]`.
+* `matmul` currently supports 2D tensors only.
