@@ -80,11 +80,11 @@ def test_cross_entropy_gradients_match_finite_differences():
 
 
 def test_repeated_backward_accumulates_leaf_grads_without_reusing_intermediate_grads():
-    values = [0.2, -0.4]
-    x = tensor([1, 2], values)
-    x.tanh().sum().backward()
+    x = tensor([1, 2], [0.2, -0.4])
+    loss = x.tanh().sum()
+    loss.backward()
     once = list(x.grad)
-    x.tanh().sum().backward()
+    loss.backward()
     for actual, expected in zip(x.grad, once):
         assert actual == pytest.approx(2.0 * expected, abs=1e-12)
 
