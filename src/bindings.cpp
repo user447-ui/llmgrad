@@ -9,6 +9,7 @@ TensorPtr embedding_forward(TensorPtr w, const std::vector<int>& idx) {
     if (!w || w->shape.size() != 2) {
         throw std::invalid_argument("Embedding: weight must be a 2D tensor");
     }
+    if (idx.empty()) throw std::invalid_argument("Embedding: indices must not be empty");
     const int rows = static_cast<int>(idx.size());
     const int cols = w->shape[1];
     for (int index : idx) {
@@ -16,17 +17,10 @@ TensorPtr embedding_forward(TensorPtr w, const std::vector<int>& idx) {
             throw std::out_of_range("Embedding: index is out of range");
         }
     }
-    auto out = Tensor::zeros(rows > 0 ? rows : 1, cols);
-    if (rows == 0) {
-        out = std::make_shared<Tensor>(std::vector<int>{1, cols});
-        out->data.clear();
-        out->grad.clear();
-        out->shape = {1, cols};
-    } else {
-        for (int i = 0; i < rows; ++i)
-            for (int j = 0; j < cols; ++j)
-                out->data[i * cols + j] = w->data[idx[i] * cols + j];
-    }
+    auto out = Tensor::zeros(rows, cols);
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < cols; ++j)
+            out->data[i * cols + j] = w->data[idx[i] * cols + j];
 
     out->_prev = {w};
     out->_backward = [out, w, idx, cols]() {
@@ -42,6 +36,7 @@ TensorPtr embedding_concat(TensorPtr w, const std::vector<int>& flat_indices, in
         throw std::invalid_argument("Embedding: weight must be a 2D tensor");
     }
     if (block_size <= 0) throw std::invalid_argument("Embedding: block_size must be positive");
+    if (flat_indices.empty()) throw std::invalid_argument("Embedding: indices must not be empty");
     const int total_indices = static_cast<int>(flat_indices.size());
     if (total_indices % block_size != 0) {
         throw std::invalid_argument("Embedding: index count must be divisible by block_size");
@@ -54,8 +49,7 @@ TensorPtr embedding_concat(TensorPtr w, const std::vector<int>& flat_indices, in
         }
     }
     const int out_cols = emb_dim * block_size;
-    auto out = std::make_shared<Tensor>(std::vector<int>{batch_size > 0 ? batch_size : 1, out_cols});
-    if (batch_size == 0) return out;
+    auto out = std::make_shared<Tensor>(std::vector<int>{batch_size, out_cols});
 
     for (int b = 0; b < batch_size; ++b) {
         for (int k = 0; k < block_size; ++k) {
