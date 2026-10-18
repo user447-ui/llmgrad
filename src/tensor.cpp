@@ -311,7 +311,8 @@ TensorPtr Tensor::max() {
     if (data.empty()) throw std::invalid_argument("Max requires a non-empty tensor");
     const auto it = std::max_element(data.begin(), data.end());
     const int index = static_cast<int>(std::distance(data.begin(), it));
-    auto out = std::make_shared<Tensor>(std::vector<int>{1, 1}, {*it});
+    auto out = std::make_shared<Tensor>(std::vector<int>{1, 1});
+    out->data[0] = *it;
     auto self = shared_from_this();
     out->_prev = {self};
     out->_backward = [out, self, index]() { self->grad[index] += out->grad[0]; };
