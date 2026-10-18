@@ -1,5 +1,3 @@
-import math
-
 import pytest
 import ctensor
 
@@ -26,7 +24,6 @@ def test_matmul_gradients_match_finite_differences():
     b_values = [0.5, -0.1, 0.8, 0.6]
     a = tensor([2, 2], a_values)
     b = tensor([2, 2], b_values)
-    scalar_value(a.matmul(b).sum()).__class__  # exercise scalar reduction
     loss = a.matmul(b).sum()
     loss.backward()
 
